@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.24.2,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-parser"
+version = "0.1.0"
+description = "CLI для выгрузки отзывов из Яндекс Карт (через headless-браузер)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Artem Chernov" }]
+keywords = ["cli", "yandex", "maps", "reviews", "scraping", "playwright"]
+dependencies = [
+  "typer>=0.12.3,<0.13",
+  "click>=8.1.7,<8.2",
+  "rich>=13.8.0,<14",
+  "pydantic>=2.7.4,<3",
+  "playwright>=1.47.0,<2",
+  "python-dateutil>=2.9.0.post0,<3",
+]
+
+[project.scripts]
+review-parser = "review_parser.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/review_parser"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+
