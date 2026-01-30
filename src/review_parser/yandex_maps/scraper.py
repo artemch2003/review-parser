@@ -41,8 +41,11 @@ async def scrape_reviews(url: str, *, options: ScrapeOptions) -> list[Review]:
         # 2) Переходим к отзывам (разные варианты UI)
         await _open_reviews_section(page, timeout_ms=options.timeout_ms)
 
-        # 3) Собираем отзывы инкрементально (учитываем виртуализацию списка)
-        raw_items = await _collect_reviews(page, limit=options.limit)
+        # 3) Грузим все отзывы (скролл + "Показать ещё")
+        await _load_all_reviews(page, limit=options.limit)
+
+        # 4) Парсим DOM
+        raw_items = await _extract_reviews_dom(page)
 
         if options.debug_screenshot_path:
             await page.screenshot(path=options.debug_screenshot_path, full_page=True)
@@ -109,108 +112,40 @@ async def _open_reviews_section(page: Page, *, timeout_ms: int) -> None:
     )
 
 
-async def _collect_reviews(page: Page, *, limit: int | None) -> list[dict[str, Any]]:
+async def _load_all_reviews(page: Page, *, limit: int | None) -> None:
     """
-    Скроллим контейнер отзывов и собираем отзывы на каждой итерации.
-    Это нужно, потому что список часто виртуализирован и в DOM одновременно
-    находится только небольшое число карточек.
+    Скроллим вниз и кликаем "Показать ещё" пока новые отзывы не перестанут появляться
+    или пока не достигнем лимита.
     """
-    collected: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    stable_rounds = 0
+    last_count = 0
 
-    no_new_rounds = 0
-    at_bottom_rounds = 0
-
-    for _ in range(800):  # предохранитель (на большие карточки)
+    for _ in range(200):  # предохранитель
+        # "Показать ещё" встречается довольно часто
         await _click_show_more_if_present(page)
 
-        visible = await _extract_reviews_dom(page)
-        added = 0
-        for it in visible:
-            key = f"{it.get('author')}|{it.get('date_text')}|{it.get('rating')}|{it.get('text')}"
-            if key in seen:
-                continue
-            seen.add(key)
-            collected.append(it)
-            added += 1
-            if limit is not None and len(collected) >= limit:
-                return collected
-
-        if added == 0:
-            no_new_rounds += 1
-        else:
-            no_new_rounds = 0
-
-        scroll_info = await _scroll_reviews_container(page)
-        if scroll_info.get("atBottom"):
-            at_bottom_rounds += 1
-        else:
-            at_bottom_rounds = 0
-
-        # Ждём догрузку/рендер после скролла
-        await page.wait_for_timeout(450)
-
-        # Условие остановки: несколько итераций подряд на дне и ничего нового не появилось
-        if at_bottom_rounds >= 6 and no_new_rounds >= 6:
-            return collected
-
-    return collected
-
-
-async def _scroll_reviews_container(page: Page) -> dict[str, Any]:
-    """
-    Скроллит контейнер, который реально содержит .business-review-view.
-    Фоллбек: скролл всей страницы, если контейнер не найден.
-    """
-    js = r"""
-() => {
-  const first = document.querySelector('.business-review-view');
-  if (!first) return { mode: 'none', moved: false, atBottom: true };
-
-  // Ищем "лучшего" предка по максимально возможной прокрутке.
-  // В Яндекс Картах нужный контейнер может быть довольно высоко по дереву (20+ уровней).
-  let best = null;
-  let cur = first;
-  for (let i = 0; i < 30 && cur; i++) {
-    const delta = (cur.scrollHeight || 0) - (cur.clientHeight || 0);
-    if (delta > 200) {
-      if (!best || delta > best.delta) best = { el: cur, delta };
-    }
-    cur = cur.parentElement;
-  }
-
-  const target = best ? best.el : null;
-  if (!target) {
-    window.scrollTo(0, document.body.scrollHeight);
-    return { mode: 'window', atBottom: true, moved: true };
-  }
-
-  const before = target.scrollTop || 0;
-  target.scrollTop = before + Math.max(1200, target.clientHeight || 0);
-  const after = target.scrollTop || 0;
-  const ch = target.clientHeight || 0;
-  const sh = target.scrollHeight || 0;
-  const atBottom = (after + ch) >= (sh - 5);
-  return {
-    mode: 'container',
-    clientHeight: ch,
-    scrollTop: after,
-    scrollHeight: sh,
-    moved: after !== before,
-    atBottom,
-  };
-}
-"""
-    try:
-        info = await page.evaluate(js)
-        return info or {}
-    except Exception:
-        # worst-case: пробуем колесо мыши
+        # Скролл: вниз страницы (в Yandex это часто работает даже если контейнер внутри)
         try:
-            await page.mouse.wheel(0, 1800)
+            await page.mouse.wheel(0, 1500)
         except Exception:
-            return {}
-    return {}
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+        await page.wait_for_timeout(400)
+
+        items = await _extract_reviews_dom(page)
+        count = len(items)
+
+        if limit is not None and count >= limit:
+            return
+
+        if count <= last_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            last_count = count
+
+        if stable_rounds >= 6:
+            return
 
 
 async def _click_show_more_if_present(page: Page) -> None:
