@@ -41,14 +41,30 @@ async def scrape_reviews(url: str, *, options: ScrapeOptions) -> list[Review]:
         # 2) Переходим к отзывам (разные варианты UI)
         await _open_reviews_section(page, timeout_ms=options.timeout_ms)
 
-        # 3) Грузим все отзывы (скролл + "Показать ещё")
-        await _load_all_reviews(page, limit=options.limit)
-
-        # 4) Парсим DOM
-        raw_items = await _extract_reviews_dom(page)
+        # 3) Собираем отзывы на лету при скролле.
+        # В Яндекс.Картах часто используется виртуализация списка: в DOM одновременно
+        # находится ограниченное число карточек (например ~50), поэтому "снять слепок"
+        # DOM в конце недостаточно — нужно накапливать элементы по мере прокрутки.
+        raw_items = await _collect_reviews_while_scrolling(page, limit=options.limit)
 
         if options.debug_screenshot_path:
-            await page.screenshot(path=options.debug_screenshot_path, full_page=True)
+            # Best-effort: дебажный скриншот не должен ломать основной сбор отзывов.
+            # full_page=True на тяжёлых страницах Яндекса иногда подвисает на ожидании шрифтов/рендера.
+            try:
+                await page.screenshot(
+                    path=options.debug_screenshot_path,
+                    full_page=True,
+                    timeout=options.timeout_ms,
+                )
+            except Exception:
+                try:
+                    await page.screenshot(
+                        path=options.debug_screenshot_path,
+                        full_page=False,
+                        timeout=min(options.timeout_ms, 15_000),
+                    )
+                except Exception:
+                    pass
 
         await context.close()
         await browser.close()
@@ -112,40 +128,53 @@ async def _open_reviews_section(page: Page, *, timeout_ms: int) -> None:
     )
 
 
-async def _load_all_reviews(page: Page, *, limit: int | None) -> None:
+async def _collect_reviews_while_scrolling(page: Page, *, limit: int | None) -> list[dict[str, Any]]:
     """
-    Скроллим вниз и кликаем "Показать ещё" пока новые отзывы не перестанут появляться
-    или пока не достигнем лимита.
+    Скроллим вниз и кликаем "Показать ещё", параллельно накапливая отзывы.
+    Это важно, потому что список может быть виртуализирован (DOM держит только часть элементов).
     """
-    stable_rounds = 0
-    last_count = 0
+    stable_rounds = 0  # сколько итераций подряд без новых уникальных отзывов
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-    for _ in range(200):  # предохранитель
+    for _ in range(260):  # предохранитель
         # "Показать ещё" встречается довольно часто
         await _click_show_more_if_present(page)
 
-        # Скролл: вниз страницы (в Yandex это часто работает даже если контейнер внутри)
-        try:
-            await page.mouse.wheel(0, 1500)
-        except Exception:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        # Скролл: стараемся скроллить именно контейнер со списком отзывов (если найден),
+        # иначе — скроллим окно.
+        await _scroll_reviews_area(page, delta=2500)
 
-        await page.wait_for_timeout(400)
+        # Даём Яндексу время подгрузить следующую порцию.
+        await page.wait_for_timeout(900)
 
         items = await _extract_reviews_dom(page)
-        count = len(items)
+        new_in_round = 0
+        for it in items:
+            # Делаем ключ из наиболее стабильных полей; порядок в out сохраняем.
+            author = (it.get("author") or "").strip()
+            date_text = (it.get("date_text") or "").strip()
+            rating = it.get("rating")
+            text = (it.get("text") or "").strip()
+            key = f"{author}|{date_text}|{rating}|{text}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+            new_in_round += 1
+            if limit is not None and len(out) >= limit:
+                return out[:limit]
 
-        if limit is not None and count >= limit:
-            return
-
-        if count <= last_count:
+        if new_in_round == 0:
             stable_rounds += 1
         else:
             stable_rounds = 0
-            last_count = count
 
-        if stable_rounds >= 6:
-            return
+        # Немного более "терпеливое" завершение: Яндекс иногда догружает пачками.
+        if stable_rounds >= 20:
+            return out
+
+    return out
 
 
 async def _click_show_more_if_present(page: Page) -> None:
@@ -161,6 +190,63 @@ async def _click_show_more_if_present(page: Page) -> None:
                 return
         except Exception:
             continue
+
+
+async def _scroll_reviews_area(page: Page, *, delta: int) -> None:
+    """
+    Пытаемся прокрутить ближайший скроллируемый контейнер, внутри которого есть отзывы.
+    Если не удалось — прокручиваем окно.
+    """
+    # 0) Попытка: довести последний отзыв до видимости (часто триггерит lazy-load/перерисовку)
+    try:
+        last = page.locator(".business-review-view").last
+        if await last.count() > 0:
+            await last.scroll_into_view_if_needed(timeout=1500)
+    except Exception:
+        pass
+
+    # 1) Попытка: скролл ближайшего скроллируемого контейнера, содержащего отзывы
+    try:
+        did = await page.evaluate(
+            """
+() => {
+  const review = document.querySelector('.business-review-view');
+  if (!review) return false;
+  let el = review.parentElement;
+  while (el) {
+    const style = window.getComputedStyle(el);
+    const overflowY = style ? style.overflowY : '';
+    const scrollable =
+      (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
+      (el.scrollHeight > el.clientHeight + 5);
+    if (scrollable) {
+      el.scrollTop = el.scrollTop + %d;
+      return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+            """
+            % int(delta)
+        )
+        if did:
+            return
+    except Exception:
+        # Фоллбеки ниже
+        pass
+
+    # 2) Попытка: навести мышь на отзыв и покрутить колесом (часто важно для внутреннего контейнера)
+    try:
+        first = page.locator(".business-review-view").first
+        if await first.count() > 0:
+            await first.hover(timeout=1500)
+        await page.mouse.wheel(0, delta)
+    except Exception:
+        try:
+            await page.keyboard.press("PageDown")
+        except Exception:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
 
 async def _wait_for_any_selector(page: Page, *, selectors: list[str], timeout_ms: int) -> None:
