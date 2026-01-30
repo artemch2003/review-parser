@@ -7,6 +7,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .codex_report import CodexReportConfig, generate_markdown_report
 from .exporters import ExportFormat, export_reviews
 from .yandex_maps.scraper import scrape_reviews_sync
 
@@ -70,6 +71,54 @@ def reviews_cmd(
     table.add_column("Значение")
     table.add_row("Отзывы", str(len(reviews)))
     table.add_row("Файл", str(out))
+    console.print(table)
+
+
+@app.command("analyze")
+def analyze_cmd(
+    inp: Path = typer.Argument(..., help="JSON-файл с отзывами (массив объектов Review)"),
+    out: Path = typer.Option(Path("report.md"), "--out", "-o", help="Куда сохранить отчёт (Markdown)"),
+    max_reviews: Optional[int] = typer.Option(
+        None,
+        "--max-reviews",
+        help="Ограничить число отзывов для анализа (полезно для быстрого прогона)",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Модель для Codex CLI (если нужно переопределить)",
+    ),
+    codex_bin: str = typer.Option(
+        "codex",
+        "--codex-bin",
+        help="Путь/имя бинаря Codex CLI (по умолчанию: codex)",
+    ),
+) -> None:
+    """
+    Генерирует Markdown-отчёт по отзывам через установленный Codex CLI.
+    """
+    cfg = CodexReportConfig(codex_bin=codex_bin, model=model, sandbox="read-only", output_language="ru")
+    try:
+        generate_markdown_report(inp, out, cfg, max_reviews=max_reviews)
+    except FileNotFoundError as e:
+        console.print(
+            "[bold red]Не найден Codex CLI.[/bold red]\n"
+            "Установи его (например):\n"
+            "  [bold]npm install -g @openai/codex[/bold]\n"
+            "И проверь, что команда [bold]codex[/bold] доступна в PATH."
+        )
+        raise typer.Exit(code=2) from e
+    except Exception as e:
+        console.print(f"[bold red]Ошибка анализа:[/bold red] {e}")
+        raise typer.Exit(code=2) from e
+
+    table = Table(title="Готово (анализ)")
+    table.add_column("Параметр")
+    table.add_column("Значение")
+    table.add_row("Вход", str(inp))
+    table.add_row("Отчёт", str(out))
+    if model:
+        table.add_row("Модель", model)
     console.print(table)
 
 
